@@ -25,7 +25,6 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     HiSparseHotSpec,
     HiSparseResidentSpec,
-    KpoolTailSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -61,7 +60,6 @@ SPEC_INSTANCES = [
     SlidingWindowSpec(**ATTENTION_KWARGS, sliding_window=128),
     CircularBufferSpec(**ATTENTION_KWARGS),
     SlidingWindowMLASpec(**MLA_KWARGS, sliding_window=128),
-    KpoolTailSpec(**ATTENTION_KWARGS, sliding_window=128),
     MambaSpec(block_size=16, shapes=((16,), (16,)), dtypes=(torch.float16,)),
     EncoderOnlyAttentionSpec(**ATTENTION_KWARGS),
     CrossAttentionSpec(**ATTENTION_KWARGS),
@@ -117,7 +115,6 @@ def test_transfer_class_agrees_with_spec_hierarchy(spec_cls: type[KVCacheSpec]):
         # A circular buffer is attention state even though the kind table does
         # not name its class.
         (CircularBufferSpec, TransferClass.ATTENTION),
-        (KpoolTailSpec, TransferClass.ATTENTION),
         (HiSparseHotSpec, TransferClass.OTHER),
         (HiSparseResidentSpec, TransferClass.OTHER),
         (MambaSpec, TransferClass.SSM),
