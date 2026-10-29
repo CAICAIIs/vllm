@@ -52,6 +52,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.engine import (
+    WIRE_VERSION,
+    TransferEngineKind,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -906,7 +910,9 @@ class _FlakyAsyncClient:
     async def post(self, url, json=None):
         self.calls.append(1)
         if len(self.calls) <= self.failures:
-            raise httpx.ReadTimeout("simulated slow bootstrap server")
+            raise mooncake_connector.httpx.ReadTimeout(
+                "simulated slow bootstrap server"
+            )
         response = MagicMock()
         response.raise_for_status = MagicMock()
         return response
@@ -920,7 +926,7 @@ async def test_register_worker_retries_on_read_timeout(monkeypatch):
 
     calls: list[int] = []
     monkeypatch.setattr(
-        httpx,
+        mooncake_connector.httpx,
         "AsyncClient",
         lambda **kwargs: _FlakyAsyncClient(2, calls),
     )
@@ -939,7 +945,7 @@ async def test_register_worker_raises_after_max_attempts(monkeypatch):
 
     calls: list[int] = []
     monkeypatch.setattr(
-        httpx,
+        mooncake_connector.httpx,
         "AsyncClient",
         lambda **kwargs: _FlakyAsyncClient(99, calls),
     )
@@ -1216,6 +1222,8 @@ def _xfer_meta(
             list(region.shared_group_ids) for region in regions
         ],
         registered_row_offsets=[region.row_offset for region in regions],
+        remote_transfer_engine=TransferEngineKind.CLASSIC.value,
+        wire_version=WIRE_VERSION,
     )
     fields.update(overrides)
     return MooncakeXferMetadata(**fields)
@@ -2481,6 +2489,8 @@ def _short_xfer_meta(worker, layout_id: int, req_blocks: dict) -> MooncakeXferMe
         remote_tp_size=worker.tp_size,
         remote_tp_rank=0,
         remote_pp_size=worker.pp_size,
+        remote_transfer_engine=TransferEngineKind.CLASSIC.value,
+        wire_version=WIRE_VERSION,
         layout_id=layout_id,
         req_blocks=req_blocks,
         kv_caches_base_addr=[],
@@ -3086,3 +3096,53 @@ def test_sleep_unregisters_and_restores_kv_caches():
         worker.restore_kv_caches()
         worker.restore_kv_caches()
         reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])
+
+
+class _StubTransfer:
+    def __init__(self, kind: TransferEngineKind) -> None:
+        self.kind = kind
+
+
+def _peer(worker_engine: str = "tent", **overrides) -> MooncakeXferMetadata:
+    fields = {
+        "remote_hostname": "10.0.0.2",
+        "remote_port": 9100,
+        "remote_tp_size": 1,
+        "remote_tp_rank": 0,
+        "req_blocks": {},
+        "kv_caches_base_addr": [],
+        "block_lens": [],
+        "kv_block_lens": [],
+        "remote_transfer_engine": worker_engine,
+        "wire_version": WIRE_VERSION,
+    }
+    fields.update(overrides)
+    return MooncakeXferMetadata(**fields)
+
+
+def test_worker_accepts_a_peer_that_moves_kv_the_same_way():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.transfer = _StubTransfer(TransferEngineKind.TENT)
+
+    assert worker._engine_mismatch(_peer()) is None
+
+
+def test_worker_rejects_a_peer_running_another_engine():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.transfer = _StubTransfer(TransferEngineKind.TENT)
+
+    mismatch = worker._engine_mismatch(_peer("classic"))
+
+    assert mismatch is not None
+    assert "both sides must select the same engine" in mismatch
+    assert "transfer_engine='classic'" in mismatch
+
+
+def test_worker_rejects_a_peer_with_another_wire_version():
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.transfer = _StubTransfer(TransferEngineKind.TENT)
+
+    mismatch = worker._engine_mismatch(_peer(wire_version=WIRE_VERSION + 1))
+
+    assert mismatch is not None
+    assert "wire version" in mismatch

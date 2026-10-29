@@ -51,15 +51,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
     MooncakePromMetrics,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.classic import (
-    ClassicTransferBackend,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.engine import (
+    WIRE_VERSION,
     MemoryRegion,
     RangeRequest,
     TransferBackend,
     TransferOp,
     TransferState,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.factory import (
+    create_transfer_backend,
+    resolve_transfer_engine,
 )
 from vllm.distributed.parallel_state import (
     get_pp_group,
@@ -656,6 +658,10 @@ class MooncakeXferMetadata(
     # peer did not send the field, so the run must not be promoted.
     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
     remote_pp_size: int = 1
+    # Engines address peer memory differently, so the pair is checked before a
+    # transfer starts.
+    remote_transfer_engine: str = ""
+    wire_version: int = 0
     # Random per register_kv_caches, so ids never repeat across restarts.
     # 0 means the peer sends the layout on every pull.
     layout_id: int = 0
@@ -1255,8 +1261,9 @@ class MooncakeConnectorWorker:
         kv_cache_config: "KVCacheConfig",
     ):
         if TransferEngine is None:
-            logger.error("Mooncake is not available")
-            raise RuntimeError("Mooncake is not available")
+            logger.warning(
+                "Mooncake is not available, so only transfer_engine='tent' can run"
+            )
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
@@ -1268,29 +1275,29 @@ class MooncakeConnectorWorker:
         self.hostname = get_ip()
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
+        extra_config = kv_transfer_config.kv_connector_extra_config
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
-        self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
-            "num_workers", 10
-        )
+        self.num_sender_workers = extra_config.get("num_workers", 10)
         # Create more tasks than workers to keep the thread pool saturated.
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
         self.num_sender_tasks = self.num_sender_workers * 2
-        protocol = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
-            "mooncake_protocol", "rdma"
-        )
-        device_name = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
-            "device_name", ""
-        )
+        protocol = extra_config.get("mooncake_protocol", "rdma")
+        device_name = extra_config.get("device_name", "")
         logger.info(
             "The Mooncake Transfer Engine is using %s as its protocol.", protocol
         )
-        self.transfer: TransferBackend = ClassicTransferBackend(
+        transfer_engine = resolve_transfer_engine(extra_config)
+        logger.info("The Mooncake connector is using %s.", transfer_engine.value)
+        self.transfer: TransferBackend = create_transfer_backend(
+            transfer_engine,
             engine_cls=TransferEngine,
             hostname=self.hostname,
             protocol=protocol,
             device_name=device_name,
+            device_id=self.device_id,
+            overrides=extra_config.get("tent_config"),
         )
         self.rpc_port = self.transfer.rpc_port
 
@@ -1585,10 +1592,41 @@ class MooncakeConnectorWorker:
             except Exception as e:
                 logger.error("Error in _sender_worker: %s", e)
 
+    def _engine_mismatch(self, meta: MooncakeXferMetadata) -> str | None:
+        """Rejects peers this worker cannot move KV blocks with.
+
+        A classic engine and TENT address peer memory differently, so a mixed
+        pair would otherwise fail inside the engine.
+        """
+        remote_engine = meta.remote_transfer_engine or "unknown"
+        if meta.remote_transfer_engine != self.transfer.kind.value:
+            return (
+                f"Mooncake peer {meta.remote_hostname}:{meta.remote_port} moves KV "
+                f"with transfer_engine={remote_engine!r} while this worker uses "
+                f"{self.transfer.kind.value!r}; both sides must select the same "
+                "engine."
+            )
+        if meta.wire_version != WIRE_VERSION:
+            return (
+                f"Mooncake peer {meta.remote_hostname}:{meta.remote_port} speaks "
+                f"wire version {meta.wire_version} while this worker speaks "
+                f"{WIRE_VERSION}; upgrade the side that is behind."
+            )
+        return None
+
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
     ):
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
+        mismatch = self._engine_mismatch(meta)
+        if mismatch is not None:
+            logger.error(mismatch)
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=mismatch,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
         if meta.remote_tp_rank not in remote_tp_ranks:
             # This D worker does not pair with the P worker.
@@ -2951,6 +2989,8 @@ class MooncakeConnectorWorker:
                 remote_tp_size=self.tp_size,
                 remote_tp_rank=self.tp_rank,
                 remote_pp_size=self.pp_size,
+                remote_transfer_engine=self.transfer.kind.value,
+                wire_version=WIRE_VERSION,
                 layout_id=self._kv_layout_id,
                 req_blocks=req_blocks,
                 kv_caches_base_addr=[],
@@ -2963,6 +3003,8 @@ class MooncakeConnectorWorker:
             remote_tp_size=self.tp_size,
             remote_tp_rank=self.tp_rank,
             remote_pp_size=self.pp_size,
+            remote_transfer_engine=self.transfer.kind.value,
+            wire_version=WIRE_VERSION,
             layout_id=self._kv_layout_id,
             req_blocks=req_blocks,
             kv_caches_base_addr=self.kv_caches_base_addr,

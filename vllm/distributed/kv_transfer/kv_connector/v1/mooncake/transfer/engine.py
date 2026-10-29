@@ -5,6 +5,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+# Bumped whenever the peer payload changes shape. Peers refuse to transfer
+# across a mismatch instead of failing somewhere inside the engine.
+WIRE_VERSION = 1
+
+
+class TransferEngineKind(Enum):
+    CLASSIC = "classic"
+    TENT = "tent"
+
 
 class TransferOp(Enum):
     READ = "read"
@@ -14,6 +23,7 @@ class TransferOp(Enum):
 class TransferState(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELED = "canceled"
 
 
 @dataclass(frozen=True)
@@ -37,6 +47,11 @@ class TransferEvent:
 
 class TransferBackend(ABC):
     """Moves KV blocks between two workers and reports per-range outcomes."""
+
+    @property
+    @abstractmethod
+    def kind(self) -> TransferEngineKind:
+        """Engine backing this backend. Peers compare it during the handshake."""
 
     @property
     @abstractmethod
