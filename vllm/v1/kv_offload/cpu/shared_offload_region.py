@@ -22,6 +22,25 @@ from vllm.v1.kv_offload.cpu.host_register import host_unregister
 
 logger = init_logger(__name__)
 
+# Regions mapped into this process, in creation order. A KV connector that
+# receives remote KV straight into host memory needs these addresses without
+# owning the offload tier that mapped them.
+_live_regions: list["SharedOffloadRegion"] = []
+
+
+def register_live_region(region: "SharedOffloadRegion") -> None:
+    _live_regions.append(region)
+
+
+def unregister_live_region(region: "SharedOffloadRegion") -> None:
+    with contextlib.suppress(ValueError):
+        _live_regions.remove(region)
+
+
+def iter_live_regions() -> Iterator["SharedOffloadRegion"]:
+    return iter(tuple(_live_regions))
+
+
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _MAP_FIXED = 0x10
@@ -237,6 +256,7 @@ class SharedOffloadRegion:
         self._canonical_offset = 0
         self.is_pinned: bool = False
         self.pinned_addresses: list[int] = []
+        register_live_region(self)
 
         if populate_shard is not None:
             return
@@ -407,6 +427,7 @@ class SharedOffloadRegion:
         return memoryview(np_arr)
 
     def cleanup(self) -> None:
+        unregister_live_region(self)
         if self.is_pinned and self._base is not None:
             base_ptr = self._base.data_ptr()
             addresses = self.pinned_addresses or [base_ptr]
