@@ -885,6 +885,10 @@ class MooncakeXferMetadata(
     # Random per register_kv_caches, so ids never repeat across restarts.
     # 0 means the peer sends the layout on every pull.
     layout_id: int = 0
+    # Host segments registered for receives that skip the GPU KV cache (rd2h).
+    # Parallel to each other; empty means the peer has no host tier.
+    host_region_addrs: list[int] = msgspec.field(default_factory=list)
+    host_region_lens: list[int] = msgspec.field(default_factory=list)
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -1687,6 +1691,10 @@ class MooncakeConnectorWorker:
         self.pp_rank = get_pp_group().rank_in_group
 
         self.kv_caches_base_addr: list[int] = []
+        self.host_region_addrs: list[int] = []
+        self.host_region_lens: list[int] = []
+        self._host_regions_registered: set[int] = set()
+        self._host_regions_lock = threading.Lock()
         self.device_kv_caches: dict[str, torch.Tensor] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
         # P holds a finished request's blocks for kv_lease_duration seconds,
@@ -1814,6 +1822,7 @@ class MooncakeConnectorWorker:
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
+        self._unregister_host_regions()
         self.async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
@@ -2523,6 +2532,7 @@ class MooncakeConnectorWorker:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
         self.device_kv_caches = kv_caches
+        self._register_host_regions()
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
             self.block_len_per_layer,
@@ -2557,7 +2567,53 @@ class MooncakeConnectorWorker:
                     f"{ready_timeout:.0f}s."
                 )
 
+    def _register_host_regions(self) -> None:
+        """Register mapped host tiers so peers can land KV straight in host memory.
+
+        The offload tier is mapped by another connector in this process, so its
+        segments are looked up instead of allocated here. Each mapping is
+        registered once: the transfer engine rejects overlapping registrations.
+        """
+        from vllm.v1.kv_offload.cpu.shared_offload_region import iter_live_regions
+
+        with self._host_regions_lock:
+            new_addrs: list[int] = []
+            new_lens: list[int] = []
+            for region in iter_live_regions():
+                base_addr = region.base_tensor.data_ptr()
+                if base_addr in self._host_regions_registered:
+                    continue
+                self._host_regions_registered.add(base_addr)
+                new_addrs.append(base_addr)
+                new_lens.append(region.total_size_bytes)
+            if not new_addrs:
+                return
+            ret_value = self.engine.batch_register_memory(new_addrs, new_lens)
+            if ret_value != 0:
+                raise RuntimeError("Mooncake host region registration failed.")
+            self.host_region_addrs.extend(new_addrs)
+            self.host_region_lens.extend(new_lens)
+            logger.info(
+                "Mooncake rd2h: registered %d host regions (%d bytes).",
+                len(new_addrs),
+                sum(new_lens),
+            )
+
+    def _unregister_host_regions(self) -> None:
+        with self._host_regions_lock:
+            if not self.host_region_addrs:
+                return
+            ret_value = self.engine.batch_unregister_memory(
+                list(self.host_region_addrs)
+            )
+            if ret_value != 0:
+                raise RuntimeError("Mooncake host region unregistration failed.")
+            self.host_region_addrs.clear()
+            self.host_region_lens.clear()
+            self._host_regions_registered.clear()
+
     def unregister_kv_caches(self) -> None:
+        self._unregister_host_regions()
         if self._kv_unregistered or not self.seen_base_addresses:
             return
         ret_value = self.engine.batch_unregister_memory(self.seen_base_addresses)
@@ -2566,6 +2622,7 @@ class MooncakeConnectorWorker:
         self._kv_unregistered = True
 
     def restore_kv_caches(self) -> None:
+        self._register_host_regions()
         if not self._kv_unregistered:
             return
         ret_value = self.engine.batch_register_memory(
@@ -3282,6 +3339,9 @@ class MooncakeConnectorWorker:
                 block_lens=[],
                 kv_block_lens=[],
             )
+        # The offload tier may map its host regions after `register_kv_caches`,
+        # so pick up anything registered since the worker started.
+        self._register_host_regions()
         return MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -3302,6 +3362,8 @@ class MooncakeConnectorWorker:
                 list(groups) for groups in self.region_shared_groups
             ],
             registered_row_offsets=self.region_row_offsets,
+            host_region_addrs=self.host_region_addrs,
+            host_region_lens=self.host_region_lens,
         )
 
     def _validate_head_resharding_layout(

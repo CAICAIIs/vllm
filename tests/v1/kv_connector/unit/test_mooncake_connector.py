@@ -4,9 +4,11 @@
 import asyncio
 import contextlib
 import errno
+import mmap
 import socket
 import threading
 import time
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -60,6 +62,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheLayout,
     MLAAttentionSpec,
+)
+from vllm.v1.kv_offload.cpu.shared_offload_region import (
+    SharedOffloadRegion,
+    iter_live_regions,
 )
 from vllm.v1.request import RequestStatus
 
@@ -3404,3 +3410,82 @@ def test_sleep_unregisters_and_restores_kv_caches():
         worker.restore_kv_caches()
         worker.restore_kv_caches()
         reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])
+
+
+@pytest.fixture
+def rd2h_host_region():
+    """A mapped host tier, released after the test so the process-wide registry
+    stays empty for the other registration tests in this module."""
+    region = SharedOffloadRegion(
+        engine_id=f"rd2h-test-{uuid.uuid4().hex}",
+        num_chunks=4,
+        rank=0,
+        kv_bytes_per_chunk=2 * mmap.PAGESIZE,
+        cpu_page_size=mmap.PAGESIZE,
+    )
+    try:
+        yield region
+    finally:
+        region.cleanup()
+    assert region not in iter_live_regions()
+
+
+def _register_lbhc_kv_caches(worker) -> torch.Tensor:
+    spec = FullAttentionSpec(
+        block_size=maybe_update_block_size(16),
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    layer_names = ["model.layers.0.self_attn", "model.layers.1.self_attn"]
+    for layer_name in layer_names:
+        worker._layer_specs[layer_name] = spec
+    raw = torch.zeros(2 * 2 * spec.page_size_bytes, dtype=torch.int8)
+    views = dense_kv_cache_views(raw, spec, 2, 2, KVCacheLayout.LBHNC)
+    worker.register_kv_caches(dict(zip(layer_names, views)))
+    return raw
+
+
+def test_rd2h_registers_host_region_and_publishes_it(rd2h_host_region):
+    """A mapped host tier must reach the per-peer handshake so a prefill can
+    address it, and a second pass must not register the same range again."""
+    with mooncake_register_worker(_make_test_kv_cache_config()) as (worker, reg):
+        _register_lbhc_kv_caches(worker)
+
+        host_ptr = rd2h_host_region.base_tensor.data_ptr()
+        host_len = rd2h_host_region.total_size_bytes
+        assert reg.call_args_list[1][0] == ([host_ptr], [host_len])
+        assert worker.host_region_addrs == [host_ptr]
+        assert worker.host_region_lens == [host_len]
+
+        meta = worker._build_xfer_metadata({}, include_regions=True)
+        assert meta.host_region_addrs == [host_ptr]
+        assert meta.host_region_lens == [host_len]
+
+        worker._register_host_regions()
+        assert reg.call_count == 2
+
+
+def test_rd2h_host_region_registration_failure_raises(rd2h_host_region):
+    """A failed host registration must stop the worker: peers would otherwise
+    address memory the engine does not own."""
+    with mooncake_register_worker(_make_test_kv_cache_config()) as (worker, reg):
+        reg.side_effect = [0, -1]
+        with pytest.raises(RuntimeError, match="host region registration failed"):
+            _register_lbhc_kv_caches(worker)
+        assert worker.host_region_addrs == []
+
+
+def test_rd2h_unregisters_host_regions_once(rd2h_host_region):
+    """Host regions are released exactly once, mirroring the KV caches."""
+    with mooncake_register_worker(_make_test_kv_cache_config()) as (worker, reg):
+        _register_lbhc_kv_caches(worker)
+        host_ptr = rd2h_host_region.base_tensor.data_ptr()
+        with patch.object(
+            worker.engine, "batch_unregister_memory", return_value=0
+        ) as unreg:
+            worker._unregister_host_regions()
+            worker._unregister_host_regions()
+        unreg.assert_called_once_with([host_ptr])
+        assert worker.host_region_addrs == []
+        assert worker.host_region_lens == []
