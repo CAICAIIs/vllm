@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from itertools import chain
@@ -53,6 +53,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     ScheduleEndContext,
@@ -2199,6 +2200,20 @@ class OffloadingConnectorScheduler:
                         self._current_batch_jobs_to_flush.add(job_id)
 
         return store_jobs
+
+    def reserve_store_slots(
+        self, req_id: str, keys: Collection[OffloadKey]
+    ) -> PrepareStoreOutput | None:
+        """Reserve host slots for blocks that arrive from a remote peer.
+
+        The returned spec names the slots the KV is stored in, so a transfer
+        that writes the slots directly can mark them stored without a
+        GPU-to-host copy.
+        """
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return None
+        return self.manager.prepare_store(keys, req_status.req_context)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
