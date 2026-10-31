@@ -958,6 +958,9 @@ class PullReqMeta:
     local_block_ids: list[list[int]]
     remote_engine_id: EngineId
     remote_bootstrap_addr: str
+    # Host slots the offload tier reserved for this read. Empty means the read
+    # lands in the decoder's KV cache blocks, as it does without staging.
+    host_block_ids: list[list[int]] = field(default_factory=list)
     # Set expire time to avoid infinitely sending requests.
     expire_time: float = float("inf")
     # Designed for one D pairing to multiple P

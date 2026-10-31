@@ -693,7 +693,10 @@ class MooncakePullConnectorWorker(MooncakeConnectorWorker):
             BlockTransferRequest(
                 key=d_req_id,
                 src_block_ids=producer_block_ids,
-                dst_block_ids=pull_metas[d_req_id].local_block_ids,
+                dst_block_ids=(
+                    pull_metas[d_req_id].host_block_ids
+                    or pull_metas[d_req_id].local_block_ids
+                ),
             )
             for d_req_id, (_, producer_block_ids) in resolved.items()
             if d_req_id in pull_metas
