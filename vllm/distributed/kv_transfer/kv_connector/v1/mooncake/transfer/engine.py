@@ -21,9 +21,18 @@ class TransferOp(Enum):
 
 
 class TransferState(Enum):
+    """Outcome of one range.
+
+    `IN_FLIGHT` is what a backend reports when it could not confirm that the
+    engine stopped touching the memory. The ranges were submitted and may still
+    be written, so the caller has to keep the memory reserved instead of
+    treating the ranges as finished and handing them to the next request.
+    """
+
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELED = "canceled"
+    IN_FLIGHT = "in_flight"
 
 
 @dataclass(frozen=True)

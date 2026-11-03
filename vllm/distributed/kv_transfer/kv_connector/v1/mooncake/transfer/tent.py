@@ -50,6 +50,10 @@ SHUTDOWN_TIMEOUT_S = 5.0
 # and 0 waits forever.
 DEFAULT_TRANSFER_TIMEOUT_S = 60.0
 
+# How long a submission waits for the batches of a failed peer to finish before
+# it refuses to reuse that peer's segment.
+SEGMENT_REOPEN_TIMEOUT_S = 5.0
+
 # Reused `tent.Request` objects retained between submissions. A submission that
 # needs more builds them and lets them go, so one huge request does not pin
 # memory for the life of the worker.
@@ -201,15 +205,15 @@ class TentTransferBackend(TransferBackend):
             return _failed(ranges, str(error))
         try:
             events = self._wait(batch_id)
-        except _EngineFailure as error:
-            logger.warning("TENT failed batch %d: %s", batch_id, error)
-            self._abandon(batch_id)
+        except (_EngineFailure, _TransferAborted) as error:
+            logger.warning("TENT did not settle batch %d: %s", batch_id, error)
+            stopped = self._abandon(batch_id)
             self._forget_segment(peer)
-            return _failed(ranges, str(error))
-        except _TransferAborted as error:
-            logger.warning("TENT abandoned batch %d: %s", batch_id, error)
-            self._abandon(batch_id)
-            self._forget_segment(peer)
+            if not stopped:
+                # The engine may still be writing through this batch, so the
+                # ranges are not failures the caller can retry over the same
+                # memory; they stay reserved until shutdown confirms the stop.
+                return _unresolved(ranges, str(error))
             return _failed(ranges, str(error))
         if any(event.state is not TransferState.COMPLETED for event in events):
             # The peer may have restarted, so the handle is not reused.
@@ -340,49 +344,76 @@ class TentTransferBackend(TransferBackend):
             submission = self._batches.get(batch_id)
         if submission is None:
             return []
+        events: list[TransferEvent] = []
+        already_settled = False
         with submission.lock:
             if all(result is not None for result in submission.results):
-                return []
-            statuses = None
-            if not all_completed:
-                statuses = self._engine_call(
-                    "reading the per-task status",
-                    self._engine.get_transfer_status_list,
-                    batch_id,
-                )
-                if len(statuses) != len(submission.tasks):
-                    raise _EngineFailure(
-                        f"TENT returned {len(statuses)} statuses for "
-                        f"{len(submission.tasks)} tasks."
+                # Every task settled but the batch is still registered: an
+                # earlier free failed, so retry it instead of waiting for
+                # `shutdown` to be the only one that ever tries again.
+                already_settled = True
+            else:
+                statuses = None
+                if not all_completed:
+                    statuses = self._engine_call(
+                        "reading the per-task status",
+                        self._engine.get_transfer_status_list,
+                        batch_id,
                     )
-            pending = False
-            settled: list[TransferEvent] = []
-            completed_event = TransferEvent(state=TransferState.COMPLETED)
-            for index, task in enumerate(submission.tasks):
-                state = submission.results[index]
-                if state is None:
-                    if statuses is None:
-                        state = TransferState.COMPLETED
-                        submission.results[index] = state
-                        settled.extend([completed_event] * task.count)
-                        continue
-                    state = self._event_state(statuses[index].state)
-                    if state is None:
-                        pending = True
-                        continue
-                    submission.results[index] = state
-                    if state is not TransferState.COMPLETED:
-                        submission.errors[index] = (
-                            f"TENT reported {statuses[index].state}"
+                    if len(statuses) != len(submission.tasks):
+                        raise _EngineFailure(
+                            f"TENT returned {len(statuses)} statuses for "
+                            f"{len(submission.tasks)} tasks."
                         )
-                event = TransferEvent(state=state, error=submission.errors[index])
-                settled.extend([event] * task.count)
-            if pending:
-                return []
-            events = settled
-        if not self._finish(batch_id, submission):
+                pending = False
+                settled: list[TransferEvent] = []
+                completed_event = TransferEvent(state=TransferState.COMPLETED)
+                for index, task in enumerate(submission.tasks):
+                    state = submission.results[index]
+                    if state is None:
+                        if statuses is None:
+                            state = TransferState.COMPLETED
+                            submission.results[index] = state
+                            settled.extend([completed_event] * task.count)
+                            continue
+                        state = self._event_state(statuses[index].state)
+                        if state is None:
+                            pending = True
+                            continue
+                        submission.results[index] = state
+                        if state is not TransferState.COMPLETED:
+                            submission.errors[index] = (
+                                f"TENT reported {statuses[index].state}"
+                            )
+                    event = TransferEvent(state=state, error=submission.errors[index])
+                    settled.extend([event] * task.count)
+                if pending:
+                    return []
+                events = settled
+        if already_settled:
+            self._retry_free(batch_id, submission)
             return []
+        # The ranges have their outcome either way; a batch the engine will not
+        # free stays registered for `shutdown` to retry.
+        self._retry_free(batch_id, submission)
         return events
+
+    def _retry_free(self, batch_id: int, submission: _Submission) -> bool:
+        """Frees a settled batch, logging rather than hiding a problem.
+
+        The ranges already have their outcome, so a batch the engine will not
+        free is a leak that `shutdown` retries; it is not a reason to turn a
+        finished transfer into a failure.
+        """
+        try:
+            return self._finish(batch_id, submission)
+        except _EngineFailure as error:
+            logger.warning(
+                "TENT cannot free batch %d (%s); shutdown will retry.",
+                batch_id,
+                error,
+            )
+            return False
 
     def _finish(self, batch_id: int, submission: _Submission) -> bool:
         """Frees a settled batch, then forgets it.
@@ -414,7 +445,7 @@ class TentTransferBackend(TransferBackend):
         with self._lifecycle_lock:
             self._closed.set()
             with self._batches_lock:
-                in_flight = {
+                outstanding = {
                     batch_id: [
                         index
                         for index, result in enumerate(submission.results)
@@ -422,15 +453,18 @@ class TentTransferBackend(TransferBackend):
                     ]
                     for batch_id, submission in self._batches.items()
                 }
-        for batch_id, outstanding in in_flight.items():
-            for index in outstanding:
+        for batch_id, indices in outstanding.items():
+            for index in indices:
                 if not self._cancel(batch_id, index):
                     break
         try:
-            remaining = self._settle(list(in_flight), SHUTDOWN_TIMEOUT_S)
+            # Settled batches stay in the registry when the engine refused to
+            # free them, so the drain has to cover every registered batch, not
+            # only the ones that were still running.
+            remaining = self._settle(list(outstanding), SHUTDOWN_TIMEOUT_S)
         except _EngineFailure as error:
             raise RuntimeError(
-                f"TENT could not confirm that {len(in_flight)} batches settled "
+                f"TENT could not confirm that {len(outstanding)} batches settled "
                 f"({error}), so the KV memory behind them, and the segments that "
                 "reach it, stay open."
             ) from error
@@ -441,12 +475,23 @@ class TentTransferBackend(TransferBackend):
                 "segments that reach it, stay open."
             )
         with self._segment_lock:
-            segments = list(self._segments.values())
-            self._segments.clear()
-            self._segment_users.clear()
-        for segment in segments:
-            self._engine_call(
-                "closing a peer segment", self._engine.close_segment, segment
+            segments = dict(self._segments)
+        failures: list[str] = []
+        for peer, segment in segments.items():
+            with self._segment_lock:
+                self._segments.pop(peer, None)
+                self._segment_users.pop(peer, None)
+            if self._close_segment(peer, segment):
+                self._stale_peers.discard(peer)
+                continue
+            # The handle stays registered so a later shutdown can retry it.
+            with self._segment_lock:
+                self._segments[peer] = segment
+            failures.append(peer)
+        if failures:
+            raise RuntimeError(
+                f"TENT could not close the segments for {sorted(failures)}, so "
+                "their handles stay registered for the next shutdown."
             )
 
     def _cancel(self, batch_id: int, index: int) -> bool:
@@ -486,16 +531,18 @@ class TentTransferBackend(TransferBackend):
             time.sleep(POLL_INTERVAL_MAX_S)
         return pending
 
-    def _abandon(self, batch_id: int) -> None:
+    def _abandon(self, batch_id: int) -> bool:
         """Cancels what is left of a failed batch and frees it if it settles.
 
-        Cleanup never masks the failure the caller is about to report, so a
-        cleanup problem is logged and the batch stays for `shutdown` to retry.
+        Returns whether the batch is gone, which tells the caller whether the
+        memory behind it can be handed back. Cleanup never masks the failure the
+        caller is about to report, so a cleanup problem is logged and the batch
+        stays for `shutdown` to retry.
         """
         with self._batches_lock:
             submission = self._batches.get(batch_id)
         if submission is None:
-            return
+            return True
         try:
             for index, result in enumerate(submission.results):
                 if result is None and not self._cancel(batch_id, index):
@@ -503,12 +550,14 @@ class TentTransferBackend(TransferBackend):
             remaining = self._settle([batch_id], SHUTDOWN_TIMEOUT_S)
         except Exception as error:
             logger.warning("TENT cannot clean up batch %d: %s", batch_id, error)
-            return
+            return False
         if remaining:
             logger.warning(
                 "TENT kept batch %d after a failed transfer; shutdown will retry.",
                 batch_id,
             )
+            return False
+        return True
 
     def _engine_call(self, action: str, call: Any, *args: Any) -> Any:
         """Runs one engine call, tagging its failure as an engine fault."""
@@ -528,35 +577,60 @@ class TentTransferBackend(TransferBackend):
         return None
 
     def _segment(self, peer: str) -> int:
-        """Opens the peer's segment once, or hands back the open handle."""
-        segment = self._segments.get(peer)
-        if segment is not None:
-            return segment
-        with self._segment_lock:
-            segment = self._segments.get(peer)
-            if segment is None:
-                segment = int(
-                    self._engine_call(
-                        f"opening segment {peer}", self._engine.open_segment, peer
+        """Opens the peer's segment once, or hands back the open handle.
+
+        A peer marked stale may have restarted, so its handle is not handed to a
+        new submission: while batches still run over it the submission is
+        refused, and once they finish the handle is dropped and opened again.
+        """
+        deadline = time.monotonic() + SEGMENT_REOPEN_TIMEOUT_S
+        while True:
+            with self._segment_lock:
+                stale = peer in self._stale_peers
+                if not stale:
+                    segment = self._segments.get(peer)
+                    if segment is not None:
+                        return segment
+                elif not self._segment_users.get(peer):
+                    self._stale_peers.discard(peer)
+                    segment = self._segments.pop(peer, None)
+                else:
+                    segment = None
+            if stale:
+                if segment is not None:
+                    self._close_segment(peer, segment)
+                if time.monotonic() > deadline:
+                    raise _EngineFailure(
+                        f"the segment for {peer} is stale and "
+                        f"{self._segment_users.get(peer, 0)} batches still use it."
                     )
-                )
-                self._segments[peer] = segment
-        return segment
+                time.sleep(POLL_INTERVAL_MAX_S)
+                continue
+            with self._segment_lock:
+                segment = self._segments.get(peer)
+                if segment is None:
+                    segment = int(
+                        self._engine_call(
+                            f"opening segment {peer}", self._engine.open_segment, peer
+                        )
+                    )
+                    self._segments[peer] = segment
+            return segment
 
     def _forget_segment(self, peer: str) -> None:
-        """Drops a peer's handle after a failure, so the next transfer reopens it.
+        """Marks a peer's handle stale after a failure.
 
         A peer that restarted keeps its address, so a cached handle would point
-        at a segment that no longer exists. Closing waits for the batches still
-        running over that handle.
+        at a segment that no longer exists. The handle is closed only once the
+        batches still running over it finish.
         """
         with self._segment_lock:
+            self._stale_peers.add(peer)
             if self._segment_users.get(peer):
-                self._stale_peers.add(peer)
                 return
-            segment = self._segments.pop(peer, None)
+            segment = self._segments.get(peer)
         if segment is not None:
-            self._close_segment(peer, segment)
+            self._close_stale(peer, segment)
 
     def _release_segment_use(self, peer: str) -> None:
         """Counts one batch out, closing a handle whose peer was marked stale."""
@@ -568,18 +642,32 @@ class TentTransferBackend(TransferBackend):
             self._segment_users.pop(peer, None)
             if peer not in self._stale_peers:
                 return
-            self._stale_peers.discard(peer)
-            segment = self._segments.pop(peer, None)
+            segment = self._segments.get(peer)
         if segment is not None:
-            self._close_segment(peer, segment)
+            self._close_stale(peer, segment)
 
-    def _close_segment(self, peer: str, segment: int) -> None:
+    def _close_stale(self, peer: str, segment: int) -> None:
+        """Closes a stale handle, keeping it registered while the engine refuses."""
+        if not self._close_segment(peer, segment):
+            return
+        with self._segment_lock:
+            if self._segments.get(peer) == segment:
+                self._segments.pop(peer, None)
+            self._stale_peers.discard(peer)
+
+    def _close_segment(self, peer: str, segment: int) -> bool:
+        """Closes one handle, reporting whether the engine let it go."""
         try:
             self._engine.close_segment(segment)
         except Exception as error:
-            # The caller already has its outcome; a handle the engine cannot
-            # close is a leak, not a reason to turn a report into an exception.
-            logger.warning("TENT could not close the segment for %s: %s", peer, error)
+            logger.warning(
+                "TENT could not close the segment for %s: %s; the handle stays "
+                "registered for the next shutdown.",
+                peer,
+                error,
+            )
+            return False
+        return True
 
     def _take_requests(self, count: int) -> list[Any]:
         """Hands back `count` request objects, reusing pooled ones first."""
@@ -658,6 +746,15 @@ def _import_tent_module() -> Any:
 def _failed(ranges: Sequence[RangeRequest], error: str) -> list[TransferEvent]:
     """Reports every range of an aborted request as failed."""
     return [TransferEvent(state=TransferState.FAILED, error=error) for _ in ranges]
+
+
+def _unresolved(ranges: Sequence[RangeRequest], error: str) -> list[TransferEvent]:
+    """Reports every range as still possibly being written.
+
+    Used when a batch could not be stopped: the memory behind it must stay
+    reserved, so the ranges cannot be reported as failed.
+    """
+    return [TransferEvent(state=TransferState.IN_FLIGHT, error=error) for _ in ranges]
 
 
 def _write_config_file(config: Mapping[str, Any]) -> str:

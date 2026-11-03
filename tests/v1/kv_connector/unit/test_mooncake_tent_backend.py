@@ -635,7 +635,7 @@ def test_transfer_reports_failed_ranges_when_the_submission_raises():
     assert ("free", 1) in backend._engine.calls
 
 
-def test_transfer_reports_failed_ranges_when_the_status_query_raises():
+def test_an_unreadable_status_leaves_the_ranges_in_flight():
     _install_fake_tent(polls=[[_StatusEnum.COMPLETED]])
     backend = _build()
 
@@ -646,7 +646,8 @@ def test_transfer_reports_failed_ranges_when_the_status_query_raises():
 
     events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(2))
 
-    assert [event.state for event in events] == [TransferState.FAILED] * 2
+    # Nothing confirms the transfer stopped, so the memory has to stay reserved.
+    assert [event.state for event in events] == [TransferState.IN_FLIGHT] * 2
     assert "status unavailable" in events[0].error
     # Without a verdict the batch cannot be freed, so shutdown has to settle it.
     assert list(backend._batches) == [1]
@@ -710,11 +711,100 @@ def test_a_transfer_that_never_settles_times_out(monkeypatch):
     _install_fake_tent(polls=[[_StatusEnum.PENDING]], cancel_settles=True)
     backend = _build(transfer_timeout_s=0.01)
 
-    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(2))
+    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
 
-    assert [event.state for event in events] == [TransferState.FAILED] * 2
+    assert [event.state for event in events] == [TransferState.FAILED]
     assert "did not settle" in events[0].error
     assert ("cancel", 1, 0) in backend._engine.calls
+
+
+def test_a_transfer_the_engine_cannot_stop_is_reported_in_flight(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent."
+        "SHUTDOWN_TIMEOUT_S",
+        0.05,
+    )
+    _install_fake_tent(
+        polls=[[_StatusEnum.PENDING]],
+        cancel_error=_TentNotImplemented("staging transfers cannot be canceled"),
+    )
+    backend = _build(transfer_timeout_s=0.01)
+
+    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    # The batch is still running, so the ranges are not failures the caller may
+    # retry over the same memory.
+    assert [event.state for event in events] == [TransferState.IN_FLIGHT]
+    assert "did not settle" in events[0].error
+    assert backend._batches != {}
+
+    with pytest.raises(RuntimeError, match="still holds"):
+        backend.shutdown()
+
+
+def test_a_new_submission_is_refused_while_the_peer_segment_is_stale(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent."
+        "SEGMENT_REOPEN_TIMEOUT_S",
+        0.05,
+    )
+    _install_fake_tent()
+    backend = _build()
+    peer = "10.0.0.2:9100"
+    backend.transfer(peer, TransferOp.WRITE, _ranges(1))
+    opens_before = len([call for call in backend._engine.calls if call[0] == "open"])
+    # Another batch still runs over the handle, so the peer is stale with users.
+    backend._stale_peers.add(peer)
+    backend._segment_users[peer] = 1
+
+    events = backend.transfer(peer, TransferOp.WRITE, _ranges(1))
+
+    assert events[0].state is TransferState.FAILED
+    assert "stale" in events[0].error
+    opens_after = len([call for call in backend._engine.calls if call[0] == "open"])
+    assert opens_after == opens_before
+
+
+def test_a_free_failure_is_retried_by_the_next_poll():
+    _install_fake_tent(polls=[[_StatusEnum.COMPLETED]], free_error=RuntimeError("busy"))
+    backend = _build()
+
+    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    assert events[0].state is TransferState.COMPLETED
+    assert backend._batches != {}
+
+    _CONTROL.free_error = None
+    assert backend._poll(1) == []
+
+    assert backend._batches == {}
+    assert ("free", 1) in backend._engine.calls
+
+
+def test_a_failed_segment_close_is_retried_by_the_next_shutdown(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent."
+        "SHUTDOWN_TIMEOUT_S",
+        0.05,
+    )
+    _install_fake_tent()
+    backend = _build()
+    backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    original_close = backend._engine.close_segment
+
+    def _refuse_once(segment: int) -> None:
+        backend._engine.close_segment = original_close
+        raise RuntimeError("engine is busy")
+
+    backend._engine.close_segment = _refuse_once
+
+    with pytest.raises(RuntimeError, match="could not close the segments"):
+        backend.shutdown()
+    assert backend._segments != {}
+
+    backend.shutdown()
+    assert backend._segments == {}
 
 
 def test_shutdown_keeps_the_segment_when_a_batch_never_settles(monkeypatch):
@@ -774,8 +864,9 @@ def test_free_failure_keeps_the_batch_for_shutdown(monkeypatch):
 
     events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
 
-    assert events[0].state is TransferState.FAILED
-    # Freeing failed, so the batch stays registered for `shutdown` to retry.
+    # The range really did move; a batch the engine would not free is a leak
+    # that `shutdown` retries, not a failed transfer.
+    assert events[0].state is TransferState.COMPLETED
     assert backend._batches != {}
 
 

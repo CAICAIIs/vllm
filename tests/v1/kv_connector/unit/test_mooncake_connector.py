@@ -530,7 +530,7 @@ async def test_send_kv_to_decode_aligns_consumer_regions_by_layer_metadata(
         identity = b"consumer-layer-align"
 
         with patch.object(
-            prefill_worker, "_send_blocks", return_value=([], None)
+            prefill_worker, "_send_blocks", return_value=([], [], None)
         ) as mock_send_blocks:
             await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
 
@@ -1408,7 +1408,9 @@ async def test_heterogeneous_pp_waits_for_consumer_without_shared_layers():
             sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
             with (
                 patch.object(worker, "sender_loop", asyncio.get_running_loop()),
-                patch.object(worker, "_send_blocks", return_value=([], None)) as send,
+                patch.object(
+                    worker, "_send_blocks", return_value=([], [], None)
+                ) as send,
             ):
                 for pp_rank in range(2):
                     metadata = _xfer_meta(
@@ -1505,7 +1507,7 @@ async def test_kv_producer(monkeypatch):
         identity = b"consumer-id"
 
         with patch.object(
-            prefill_worker, "_send_blocks", return_value=([], None)
+            prefill_worker, "_send_blocks", return_value=([], [], None)
         ) as mock_send_blocks:
 
             def expected_transfers(src_base, dst_base, src_blocks, dst_blocks):
@@ -1602,7 +1604,7 @@ async def test_kv_producer(monkeypatch):
         with patch.object(
             prefill_worker,
             "_send_blocks",
-            return_value=(["d-req-1"], "Mooncake transfer engine returned 123"),
+            return_value=(["d-req-1"], [], "Mooncake transfer engine returned 123"),
         ) as mock_send_blocks:
             mock_socket.send_multipart.reset_mock()
             prefill_worker.reqs_need_send[transfer_id] = send_meta
@@ -2276,7 +2278,7 @@ async def test_pull_after_expiry_fails_without_waiting(with_live_req):
             req_blocks,
         )
         sock = AsyncMock(spec=zmq.asyncio.Socket, send_multipart=AsyncMock())
-        with patch.object(producer, "_send_blocks", return_value=([], None)):
+        with patch.object(producer, "_send_blocks", return_value=([], [], None)):
             await producer.send_kv_to_decode(b"consumer", sock, metadata)
 
         # No placeholder that would wait for a prefill that already ran.
@@ -3434,7 +3436,7 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
         }
 
         with patch.object(
-            prefill_worker, "_send_blocks", return_value=([], None)
+            prefill_worker, "_send_blocks", return_value=([], [], None)
         ) as mock_send_blocks:
             for d_rank in target_d_ranks:
                 remote_block_ids = d_rank_remote_blocks[d_rank]

@@ -1431,6 +1431,10 @@ class MooncakeConnectorWorker:
             ),
         )
         self.rpc_port = self.transfer_backend.rpc_port
+        # Set once a transfer could not be confirmed stopped. The blocks behind
+        # it stay reserved, so the worker refuses further transfers instead of
+        # handing the same memory to another request.
+        self._transfer_unresolved = False
 
         logger.debug(
             "Mooncake Transfer Engine initialized at %s:%d",
@@ -1606,7 +1610,11 @@ class MooncakeConnectorWorker:
             self.block_size = kernel_block_size
 
     def __del__(self):
-        self.shutdown()
+        # A worker that failed part way through __init__ never created the
+        # context; shutting down would raise while the interpreter is tearing
+        # the object down.
+        if getattr(self, "async_zmq_ctx", None) is not None:
+            self.shutdown()
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
@@ -1990,6 +1998,7 @@ class MooncakeConnectorWorker:
                 if d_req_id not in err_req_set
             ]
 
+            unresolved_set: set[ReqId] = set()
             if src_ptrs:
                 remote_session = format_peer_address(
                     meta.remote_hostname, meta.remote_port
@@ -1997,6 +2006,7 @@ class MooncakeConnectorWorker:
                 try:
                     (
                         failed_reqs,
+                        unresolved_reqs,
                         transfer_err_msg,
                     ) = await self.sender_loop.run_in_executor(
                         self._sender_executor,
@@ -2012,7 +2022,9 @@ class MooncakeConnectorWorker:
                     # left with `sending` raised never expires and its blocks
                     # stay pinned.
                     failed_reqs = [d_req_id for d_req_id, _ in ok_ready_reqs]
+                    unresolved_reqs = []
                     transfer_err_msg = f"Mooncake transfer failed: {error}"
+                unresolved_set = set(unresolved_reqs)
                 if transfer_err_msg is not None:
                     err_msg = (
                         transfer_err_msg
@@ -2032,6 +2044,13 @@ class MooncakeConnectorWorker:
                     ]
 
             for d_req_id, send_meta in ready_reqs:
+                if d_req_id in unresolved_set:
+                    # The engine may still be writing these blocks, so the
+                    # request stays counted as sending: the blocks are never
+                    # handed out again, and the worker already refused further
+                    # transfers when this happened.
+                    continue
+
                 send_meta.sending -= 1
 
                 if d_req_id in err_req_set:
@@ -2324,12 +2343,19 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
         owners: list[ReqId],
-    ) -> tuple[list[ReqId], str | None]:
-        """Moves the ranges of several requests and reports which ones failed.
+    ) -> tuple[list[ReqId], list[ReqId], str | None]:
+        """Moves the ranges of several requests and reports what happened.
 
         The events line up with `owners`, so a failed range fails its own
-        request and leaves the rest of the batch alone.
+        request and leaves the rest of the batch alone. A range the backend
+        could not confirm stopped is reported separately: its blocks must stay
+        reserved instead of being handed to the next request.
         """
+        if self._transfer_unresolved:
+            raise RuntimeError(
+                "an earlier transfer could not be confirmed stopped, so the "
+                "worker refuses to transfer again."
+            )
         ranges = [
             RangeRequest(local_addr=src, remote_addr=dst, length=length)
             for src, dst, length in zip(src_ptrs, dst_ptrs, lengths, strict=True)
@@ -2345,22 +2371,36 @@ class MooncakeConnectorWorker:
                 f"{len(ranges)} ranges."
             )
         failed_reqs: list[ReqId] = []
+        unresolved_reqs: list[ReqId] = []
         error: str | None = None
         for d_req_id, event in zip(owners, events, strict=True):
             if event.state is TransferState.COMPLETED:
                 continue
-            if d_req_id not in failed_reqs:
+            if event.state is TransferState.IN_FLIGHT:
+                if d_req_id not in unresolved_reqs:
+                    unresolved_reqs.append(d_req_id)
+            elif d_req_id not in failed_reqs:
                 failed_reqs.append(d_req_id)
             if error is None:
                 error = event.error or f"the transfer ended as {event.state.value}"
-        if not failed_reqs:
+        if unresolved_reqs:
+            self._transfer_unresolved = True
+            logger.error(
+                "TENT could not confirm that %d ranges to %s stopped (%s); "
+                "their blocks stay reserved and this worker will not transfer "
+                "again.",
+                sum(1 for event in events if event.state is TransferState.IN_FLIGHT),
+                remote_session,
+                error,
+            )
+        if not failed_reqs and not unresolved_reqs:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
                 total_bytes=sum(lengths),
                 num_descs=len(src_ptrs),
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
-            return failed_reqs, None
+            return failed_reqs, unresolved_reqs, None
         self.xfer_stats.record_failed_transfer()
         logger.warning(
             "Sending to %s failed (%s) after %s (%d descriptors, %d bytes, "
@@ -2370,9 +2410,9 @@ class MooncakeConnectorWorker:
             duration,
             len(src_ptrs),
             sum(lengths),
-            len(failed_reqs),
+            len(failed_reqs) + len(unresolved_reqs),
         )
-        return failed_reqs, error
+        return failed_reqs, unresolved_reqs, error
 
     @staticmethod
     def _memory_regions(
