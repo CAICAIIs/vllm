@@ -587,25 +587,32 @@ class TentTransferBackend(TransferBackend):
         while True:
             with self._segment_lock:
                 stale = peer in self._stale_peers
-                if not stale:
-                    segment = self._segments.get(peer)
-                    if segment is not None:
-                        return segment
-                elif not self._segment_users.get(peer):
-                    self._stale_peers.discard(peer)
-                    segment = self._segments.pop(peer, None)
-                else:
-                    segment = None
-            if stale:
-                if segment is not None:
-                    self._close_segment(peer, segment)
+                users = self._segment_users.get(peer, 0)
+                segment = self._segments.get(peer)
+            if stale and users:
                 if time.monotonic() > deadline:
                     raise _EngineFailure(
                         f"the segment for {peer} is stale and "
-                        f"{self._segment_users.get(peer, 0)} batches still use it."
+                        f"{users} batches still use it."
                     )
                 time.sleep(POLL_INTERVAL_MAX_S)
                 continue
+            if segment is not None and stale:
+                # The last batch over the stale handle finished: retire the
+                # handle before opening a new one, and keep it registered when
+                # the engine refuses so a later shutdown can retry it.
+                if not self._close_segment(peer, segment):
+                    raise _EngineFailure(
+                        f"the segment for {peer} is stale and the engine did not "
+                        "close it."
+                    )
+                with self._segment_lock:
+                    if self._segments.get(peer) == segment:
+                        self._segments.pop(peer, None)
+                    self._stale_peers.discard(peer)
+            elif stale:
+                with self._segment_lock:
+                    self._stale_peers.discard(peer)
             with self._segment_lock:
                 segment = self._segments.get(peer)
                 if segment is None:
