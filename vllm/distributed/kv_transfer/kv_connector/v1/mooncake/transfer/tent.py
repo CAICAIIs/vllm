@@ -44,6 +44,12 @@ MAX_MERGED_LENGTH = 1 << 20
 # How long `shutdown` waits for canceled transfers to settle.
 SHUTDOWN_TIMEOUT_S = 5.0
 
+# How long one submission may stay unsettled. A peer that disappears leaves the
+# batch in flight, and the connector cannot release the KV memory behind it until
+# the batch settles, so the wait is bounded. `transfer_timeout_s` overrides it
+# and 0 waits forever.
+DEFAULT_TRANSFER_TIMEOUT_S = 60.0
+
 # Reused `tent.Request` objects retained between submissions. A submission that
 # needs more builds them and lets them go, so one huge request does not pin
 # memory for the life of the worker.
@@ -75,6 +81,7 @@ class _Submission:
     `results` keeps one slot per task so events leave in range order.
     """
 
+    peer: str
     tasks: list[_Task]
     results: list[TransferState | None]
     errors: list[str | None]
@@ -95,8 +102,15 @@ class TentTransferBackend(TransferBackend):
         protocol: str,
         device_name: str,
         metrics_port: int,
+        transfer_timeout_s: float = DEFAULT_TRANSFER_TIMEOUT_S,
         overrides: Mapping[str, Any] | None = None,
     ) -> None:
+        if transfer_timeout_s < 0:
+            raise RuntimeError(
+                "transfer_timeout_s must be zero or a positive number of seconds, "
+                f"got {transfer_timeout_s}."
+            )
+        self._transfer_timeout_s = transfer_timeout_s
         self._tent = _import_tent_module()
         config = build_tent_config(
             hostname=hostname,
@@ -133,6 +147,11 @@ class TentTransferBackend(TransferBackend):
         self._rpc_port = rpc_port
         self._segments: dict[str, int] = {}
         self._segment_lock = threading.Lock()
+        # Batches still running against a peer. A handle is only closed once
+        # nothing is in flight over it.
+        self._segment_users: dict[str, int] = {}
+        # Peers whose handle stopped working. The next submission reopens them.
+        self._stale_peers: set[str] = set()
         self._batches: dict[int, _Submission] = {}
         self._batches_lock = threading.Lock()
         # Guards the closed flag together with the batch registry, so a
@@ -178,17 +197,24 @@ class TentTransferBackend(TransferBackend):
             batch_id = self._submit(peer, op, ranges)
         except (_EngineFailure, _TransferAborted) as error:
             logger.warning("TENT did not start a transfer to %s: %s", peer, error)
+            self._forget_segment(peer)
             return _failed(ranges, str(error))
         try:
-            return self._wait(batch_id)
+            events = self._wait(batch_id)
         except _EngineFailure as error:
             logger.warning("TENT failed batch %d: %s", batch_id, error)
             self._abandon(batch_id)
+            self._forget_segment(peer)
             return _failed(ranges, str(error))
         except _TransferAborted as error:
             logger.warning("TENT abandoned batch %d: %s", batch_id, error)
             self._abandon(batch_id)
+            self._forget_segment(peer)
             return _failed(ranges, str(error))
+        if any(event.state is not TransferState.COMPLETED for event in events):
+            # The peer may have restarted, so the handle is not reused.
+            self._forget_segment(peer)
+        return events
 
     def _submit(self, peer: str, op: TransferOp, ranges: Sequence[RangeRequest]) -> int:
         """Registers the batch and submits it as one atomic step.
@@ -241,19 +267,30 @@ class TentTransferBackend(TransferBackend):
             finally:
                 self._return_requests(requests)
             self._batches[batch_id] = _Submission(
+                peer=peer,
                 tasks=tasks,
                 results=[None] * len(tasks),
                 errors=[None] * len(tasks),
                 lock=threading.Lock(),
             )
+            with self._segment_lock:
+                self._segment_users[peer] = self._segment_users.get(peer, 0) + 1
             return batch_id
 
     def _wait(self, batch_id: int) -> list[TransferEvent]:
         """Waits on the aggregated batch status.
 
         One status object covers the batch, so the per-task list is read only
-        once the batch reports a terminal state.
+        once the batch reports a terminal state. `transfer_timeout_s` bounds the
+        wait: the engine retries inside a batch, so without a deadline a peer
+        that disappears would hold this thread, and the KV memory behind the
+        batch, for good.
         """
+        deadline = (
+            None
+            if self._transfer_timeout_s <= 0
+            else time.monotonic() + self._transfer_timeout_s
+        )
         delay = POLL_INTERVAL_MIN_S
         while True:
             overall = self._engine_call(
@@ -279,6 +316,11 @@ class TentTransferBackend(TransferBackend):
             if not known:
                 raise RuntimeError(
                     f"TENT dropped batch {batch_id} before its ranges settled."
+                )
+            if deadline is not None and time.monotonic() > deadline:
+                raise _TransferAborted(
+                    f"TENT did not settle batch {batch_id} within "
+                    f"{self._transfer_timeout_s}s."
                 )
             time.sleep(delay)
             delay = min(delay * 2, POLL_INTERVAL_MAX_S)
@@ -341,24 +383,31 @@ class TentTransferBackend(TransferBackend):
         return events
 
     def _finish(self, batch_id: int, submission: _Submission) -> bool:
-        """Removes a settled batch, freeing it once.
+        """Frees a settled batch, then forgets it.
 
-        The submission lock stops a concurrent poll from asking the engine about
-        a batch that was already freed.
+        The engine frees first: a batch that stays in the registry can be freed
+        by `shutdown`, one that was dropped cannot. The submission lock stops a
+        concurrent poll from asking the engine about a batch that was already
+        freed.
         """
         with submission.lock, self._batches_lock:
-            if self._batches.pop(batch_id, None) is None:
+            if batch_id not in self._batches:
                 return False
-        self._engine_call(
-            "freeing a transfer batch", self._engine.free_transfer_batch, batch_id
-        )
+            self._engine_call(
+                "freeing a transfer batch", self._engine.free_transfer_batch, batch_id
+            )
+            self._batches.pop(batch_id, None)
+        self._release_segment_use(submission.peer)
         return True
 
     def shutdown(self) -> None:
         """Cancels what is still in flight, then closes the peer segments.
 
         A batch cannot be freed while its tasks run, and the KV memory behind it
-        cannot be released before that.
+        cannot be released before that. When a batch is still running after the
+        drain, its segment stays open too: closing the handle under an unfinished
+        transfer would leave the engine writing through a segment it no longer
+        owns.
         """
         with self._lifecycle_lock:
             self._closed.set()
@@ -376,24 +425,27 @@ class TentTransferBackend(TransferBackend):
                 if not self._cancel(batch_id, index):
                     break
         try:
-            try:
-                remaining = self._settle(list(in_flight), SHUTDOWN_TIMEOUT_S)
-            except _EngineFailure as error:
-                raise RuntimeError(
-                    f"TENT could not confirm that {len(in_flight)} batches settled "
-                    f"({error}), so the KV memory behind them cannot be released."
-                ) from error
-            if remaining:
-                raise RuntimeError(
-                    f"TENT still holds {len(remaining)} batches {SHUTDOWN_TIMEOUT_S}s "
-                    "after shutting down, so the KV memory behind them cannot be "
-                    "released."
-                )
-        finally:
-            with self._segment_lock:
-                for segment in self._segments.values():
-                    self._engine.close_segment(segment)
-                self._segments.clear()
+            remaining = self._settle(list(in_flight), SHUTDOWN_TIMEOUT_S)
+        except _EngineFailure as error:
+            raise RuntimeError(
+                f"TENT could not confirm that {len(in_flight)} batches settled "
+                f"({error}), so the KV memory behind them, and the segments that "
+                "reach it, stay open."
+            ) from error
+        if remaining:
+            raise RuntimeError(
+                f"TENT still holds {len(remaining)} batches {SHUTDOWN_TIMEOUT_S}s "
+                "after shutting down, so the KV memory behind them, and the "
+                "segments that reach it, stay open."
+            )
+        with self._segment_lock:
+            segments = list(self._segments.values())
+            self._segments.clear()
+            self._segment_users.clear()
+        for segment in segments:
+            self._engine_call(
+                "closing a peer segment", self._engine.close_segment, segment
+            )
 
     def _cancel(self, batch_id: int, index: int) -> bool:
         """Cancels one task.
@@ -488,6 +540,44 @@ class TentTransferBackend(TransferBackend):
                 )
                 self._segments[peer] = segment
         return segment
+
+    def _forget_segment(self, peer: str) -> None:
+        """Drops a peer's handle after a failure, so the next transfer reopens it.
+
+        A peer that restarted keeps its address, so a cached handle would point
+        at a segment that no longer exists. Closing waits for the batches still
+        running over that handle.
+        """
+        with self._segment_lock:
+            if self._segment_users.get(peer):
+                self._stale_peers.add(peer)
+                return
+            segment = self._segments.pop(peer, None)
+        if segment is not None:
+            self._close_segment(peer, segment)
+
+    def _release_segment_use(self, peer: str) -> None:
+        """Counts one batch out, closing a handle whose peer was marked stale."""
+        with self._segment_lock:
+            remaining = self._segment_users.get(peer, 0) - 1
+            if remaining > 0:
+                self._segment_users[peer] = remaining
+                return
+            self._segment_users.pop(peer, None)
+            if peer not in self._stale_peers:
+                return
+            self._stale_peers.discard(peer)
+            segment = self._segments.pop(peer, None)
+        if segment is not None:
+            self._close_segment(peer, segment)
+
+    def _close_segment(self, peer: str, segment: int) -> None:
+        try:
+            self._engine.close_segment(segment)
+        except Exception as error:
+            # The caller already has its outcome; a handle the engine cannot
+            # close is a leak, not a reason to turn a report into an exception.
+            logger.warning("TENT could not close the segment for %s: %s", peer, error)
 
     def _take_requests(self, count: int) -> list[Any]:
         """Hands back `count` request objects, reusing pooled ones first."""

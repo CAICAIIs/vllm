@@ -1415,6 +1415,9 @@ class MooncakeConnectorWorker:
             kv_transfer_config.kv_connector_extra_config  # type: ignore[arg-type]
         )
         logger.info("The Mooncake connector is using %s.", transfer_engine.value)
+        transfer_timeout_s = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
+            "transfer_timeout_s"
+        )
         self.transfer_backend: TransferBackend = create_transfer_backend(
             transfer_engine,
             engine_cls=TransferEngine,
@@ -1422,6 +1425,7 @@ class MooncakeConnectorWorker:
             protocol=protocol,
             device_name=device_name,
             device_id=self.device_id,
+            transfer_timeout_s=transfer_timeout_s,
             overrides=kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
                 "tent_config"
             ),

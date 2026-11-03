@@ -3590,3 +3590,22 @@ def test_worker_rejects_a_peer_with_another_wire_version():
 
     assert mismatch is not None
     assert "wire version" in mismatch
+
+
+def test_worker_shutdown_closes_the_transfer_backend():
+    """The backend owns batches and segments, so worker shutdown must reach it."""
+    config = _make_worker_vllm_config("kv_producer")
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
+    ):
+        worker = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        backend = MagicMock()
+        worker.transfer_backend = backend
+
+        worker.shutdown()
+
+    backend.shutdown.assert_called_once_with()

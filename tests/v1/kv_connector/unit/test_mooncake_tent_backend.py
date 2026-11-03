@@ -76,10 +76,12 @@ class _Control:
         self.segment_name = "10.0.0.1:9100"
         self.rpc_port = 9100
         self.available = True
-        self.polls: list[list[_StatusEnum]] = []
+        self.polls: list[list[_StatusEnum]] = [[_StatusEnum.COMPLETED]]
         self.overall: list[_StatusEnum] | None = None
         self.cancel_error: BaseException | None = None
+        self.cancel_settles = False
         self.submit_error: BaseException | None = None
+        self.free_error: BaseException | None = None
         self.allocate_fails = False
 
 
@@ -122,6 +124,8 @@ class _FakeEngine:
         return self._next_batch
 
     def free_transfer_batch(self, batch_id: int) -> None:
+        if _CONTROL.free_error is not None:
+            raise _CONTROL.free_error
         self.calls.append(("free", batch_id))
 
     def open_segment(self, segment_name: str) -> int:
@@ -141,6 +145,10 @@ class _FakeEngine:
         if _CONTROL.cancel_error is not None:
             raise _CONTROL.cancel_error
         self.calls.append(("cancel", batch_id, index))
+        if _CONTROL.cancel_settles:
+            # A real engine reports the canceled tasks on the next poll.
+            settled = [_StatusEnum.CANCELED for _ in self.batches[batch_id][0]]
+            self.batches[batch_id] = [settled]
 
     def get_transfer_status_list(self, batch_id: int) -> list[_Status]:
         script = self.batches[batch_id]
@@ -206,6 +214,7 @@ def _build(
     hostname: str = "10.0.0.1",
     protocol: str = "tcp",
     device_name: str = "",
+    transfer_timeout_s: float = 60.0,
     overrides: dict[str, Any] | None = None,
 ) -> TentTransferBackend:
     return TentTransferBackend(
@@ -213,6 +222,7 @@ def _build(
         protocol=protocol,
         device_name=device_name,
         metrics_port=TENT_METRICS_BASE_PORT,
+        transfer_timeout_s=transfer_timeout_s,
         overrides=overrides,
     )
 
@@ -442,7 +452,9 @@ def test_failed_submit_frees_the_batch_and_forgets_the_submission():
     assert events[0].state is TransferState.FAILED
     assert "submit refused" in events[0].error
     assert backend._batches == {}
-    assert backend._engine.calls[-1] == ("free", 1)
+    assert ("free", 1) in backend._engine.calls
+    # The handle may have pointed at a peer that is gone, so it is dropped.
+    assert backend._segments == {}
 
 
 def test_unallocatable_batch_reports_the_task_count():
@@ -692,3 +704,102 @@ def test_backend_advertises_the_hostname_from_the_config(monkeypatch):
 def test_peer_address_brackets_ipv6():
     assert format_peer_address("2001:db8::1", 9100) == "[2001:db8::1]:9100"
     assert format_peer_address("10.0.0.1", 9100) == "10.0.0.1:9100"
+
+
+def test_a_transfer_that_never_settles_times_out(monkeypatch):
+    _install_fake_tent(polls=[[_StatusEnum.PENDING]], cancel_settles=True)
+    backend = _build(transfer_timeout_s=0.01)
+
+    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(2))
+
+    assert [event.state for event in events] == [TransferState.FAILED] * 2
+    assert "did not settle" in events[0].error
+    assert ("cancel", 1, 0) in backend._engine.calls
+
+
+def test_shutdown_keeps_the_segment_when_a_batch_never_settles(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent."
+        "SHUTDOWN_TIMEOUT_S",
+        0.05,
+    )
+    _install_fake_tent(
+        polls=[[_StatusEnum.PENDING]],
+        cancel_error=_TentNotImplemented("staging transfers cannot be canceled"),
+    )
+    backend = _build()
+    backend._submit("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    with pytest.raises(RuntimeError, match="stay open"):
+        backend.shutdown()
+
+    # The unfinished transfer still owns the handle, so it is not closed.
+    assert backend._segments
+    assert not any(call[0] == "close" for call in backend._engine.calls)
+
+
+def test_a_failed_transfer_reopens_the_peer_segment():
+    _install_fake_tent(polls=[[_StatusEnum.FAILED]])
+    backend = _build()
+
+    first = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+    second = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    assert first[0].state is TransferState.FAILED
+    assert second[0].state is TransferState.FAILED
+    opens = [call for call in backend._engine.calls if call[0] == "open"]
+    assert len(opens) == 2
+    assert backend._engine.calls.count(("close", opens[0][2])) == 1
+
+
+def test_a_second_transfer_reuses_a_healthy_peer_segment():
+    _install_fake_tent()
+    backend = _build()
+
+    backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+    backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    opens = [call for call in backend._engine.calls if call[0] == "open"]
+    assert len(opens) == 1
+
+
+def test_free_failure_keeps_the_batch_for_shutdown(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent."
+        "SHUTDOWN_TIMEOUT_S",
+        0.05,
+    )
+    _install_fake_tent(polls=[[_StatusEnum.COMPLETED]], free_error=RuntimeError("busy"))
+    backend = _build()
+
+    events = backend.transfer("10.0.0.2:9100", TransferOp.WRITE, _ranges(1))
+
+    assert events[0].state is TransferState.FAILED
+    # Freeing failed, so the batch stays registered for `shutdown` to retry.
+    assert backend._batches != {}
+
+
+def test_generated_config_disables_transports_the_connector_did_not_choose():
+    config = build_tent_config(
+        hostname="10.0.0.1",
+        protocol="rdma",
+        device_name="",
+        metrics_port=TENT_METRICS_BASE_PORT,
+    )
+
+    transports = config["transports"]
+    assert transports["rdma"] == {"enable": True}
+    assert transports["tcp"] == {"enable": False}
+    for name in ("gds", "hp_tcp", "io_uring", "mnnvl", "nvlink", "shm"):
+        assert transports[name] == {"enable": False}
+
+
+def test_generated_config_trims_device_names():
+    config = build_tent_config(
+        hostname="10.0.0.1",
+        protocol="rdma",
+        device_name="mlx5_0, mlx5_1",
+        metrics_port=TENT_METRICS_BASE_PORT,
+    )
+
+    assert config["topology"]["rdma_whitelist"] == ["mlx5_0", "mlx5_1"]

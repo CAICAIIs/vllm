@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.te import (
     TransferEngineBackend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent import (
+    DEFAULT_TRANSFER_TIMEOUT_S,
     TentTransferBackend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.transfer.tent_config import (
@@ -61,6 +62,7 @@ def create_transfer_backend(
     protocol: str,
     device_name: str,
     device_id: int,
+    transfer_timeout_s: float | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> TransferBackend:
     if kind is TransferEngineKind.TE:
@@ -81,6 +83,9 @@ def create_transfer_backend(
         protocol=protocol,
         device_name=device_name,
         metrics_port=TENT_METRICS_BASE_PORT + device_id,
+        transfer_timeout_s=DEFAULT_TRANSFER_TIMEOUT_S
+        if transfer_timeout_s is None
+        else transfer_timeout_s,
         overrides=overrides,
     )
 

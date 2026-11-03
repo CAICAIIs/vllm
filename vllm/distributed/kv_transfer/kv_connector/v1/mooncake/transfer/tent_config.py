@@ -7,6 +7,10 @@ TENT_METRICS_BASE_PORT = 9100
 
 SUPPORTED_PROTOCOLS = ("rdma", "tcp")
 
+# TENT installs these by itself depending on how it was built, so a deployment
+# that asked for one transport would still serve the others.
+DISABLED_TRANSPORTS = ("gds", "hp_tcp", "io_uring", "mnnvl", "nvlink", "shm")
+
 
 def build_tent_config(
     *,
@@ -30,14 +34,14 @@ def build_tent_config(
         # Peers are addressed through the connector, so no metadata service.
         "metadata_type": "p2p",
         "rpc_server_hostname": hostname,
-        # RDMA is installed by default, so the unused transport is switched off.
         "transports": {
+            **{name: {"enable": False} for name in DISABLED_TRANSPORTS},
             "tcp": {"enable": protocol == "tcp"},
             "rdma": {"enable": protocol == "rdma"},
         },
         "metrics": {"enabled": metrics_port > 0, "http_port": metrics_port},
     }
-    devices = [name for name in device_name.split(",") if name]
+    devices = [name.strip() for name in device_name.split(",") if name.strip()]
     if devices:
         config["topology"] = {"rdma_whitelist": devices}
     if overrides is not None and not isinstance(overrides, Mapping):
