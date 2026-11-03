@@ -266,13 +266,15 @@ class TentTransferBackend(TransferBackend):
                 raise
             finally:
                 self._return_requests(requests)
-            self._batches[batch_id] = _Submission(
+            submission = _Submission(
                 peer=peer,
                 tasks=tasks,
                 results=[None] * len(tasks),
                 errors=[None] * len(tasks),
                 lock=threading.Lock(),
             )
+            with self._batches_lock:
+                self._batches[batch_id] = submission
             with self._segment_lock:
                 self._segment_users[peer] = self._segment_users.get(peer, 0) + 1
             return batch_id
@@ -314,7 +316,7 @@ class TentTransferBackend(TransferBackend):
             with self._batches_lock:
                 known = batch_id in self._batches
             if not known:
-                raise RuntimeError(
+                raise _EngineFailure(
                     f"TENT dropped batch {batch_id} before its ranges settled."
                 )
             if deadline is not None and time.monotonic() > deadline:
